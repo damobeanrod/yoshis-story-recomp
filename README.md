@@ -105,6 +105,82 @@ rebuild if that happens.
 
 ---
 
+## Building a release AppImage (Ubuntu 24.04)
+
+AppImages are not committed to the repo. To produce one:
+
+### 1. Build the binary
+
+Inside an Ubuntu 24.04 environment (distrobox works well):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -G Ninja
+cmake --build build -j$(nproc)
+```
+
+### 2. Download the packaging tools
+
+```bash
+mkdir -p appimage-tools
+wget -O appimage-tools/linuxdeploy \
+    https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+wget -O appimage-tools/appimagetool \
+    https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+chmod +x appimage-tools/linuxdeploy appimage-tools/appimagetool
+```
+
+### 3. Assemble the AppDir
+
+```bash
+mkdir -p AppDir/usr/bin
+cp build/yoshis_story_recomp AppDir/usr/bin/
+cp assets/icon.png AppDir/yoshis-story-recomp.png
+
+cat > AppDir/yoshis-story-recomp.desktop << 'EOF'
+[Desktop Entry]
+Type=Application
+Name=Yoshi's Story Recomp
+Exec=yoshis_story_recomp
+Icon=yoshis-story-recomp
+Categories=Game;
+EOF
+
+cat > AppDir/AppRun << 'EOF'
+#!/bin/bash
+APPDIR="$(dirname "$(readlink -f "$0")")"
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH}"
+if [ -z "$YOSHI_DATA_DIR" ] && [ -n "$APPIMAGE" ]; then
+    export YOSHI_DATA_DIR="$(dirname "$(readlink -f "$APPIMAGE")")/data"
+fi
+exec "${APPDIR}/usr/bin/yoshis_story_recomp" "$@"
+EOF
+chmod +x AppDir/AppRun
+```
+
+### 4. Create the AppImage
+
+Run `appimagetool` from the host (it needs the `file` command, which may not be
+in a distrobox). On NixOS: `nix-shell -p file --run "..."`.
+
+```bash
+APPIMAGE_EXTRACT_AND_RUN=1 appimage-tools/appimagetool \
+    AppDir yoshis-story-recomp-x86_64.AppImage
+```
+
+The resulting AppImage requires SDL2, GTK3, and a Vulkan driver to be installed
+on the target system — all present by default on Ubuntu 24.04+.
+
+Users put their ROM and saves in a `data/` folder next to the AppImage:
+
+```
+yoshis-story-recomp-x86_64.AppImage
+data/
+  yoshis_story.z64
+  saves/
+```
+
+---
+
 ## Data folder
 
 The game stores everything in one folder: the ROM (`yoshis_story.z64`),

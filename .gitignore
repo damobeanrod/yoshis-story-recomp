@@ -11,3 +11,5 @@ rsp/aspMain.toml
 data/saves/
 imgui.ini
 *.bak
+*.AppImage
+appimage-tools/
