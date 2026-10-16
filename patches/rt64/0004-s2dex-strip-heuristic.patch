@@ -1,0 +1,40 @@
+diff --git a/src/hle/rt64_state.cpp b/src/hle/rt64_state.cpp
+index 2970e71..0ab0cbe 100644
+--- a/src/hle/rt64_state.cpp
++++ b/src/hle/rt64_state.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <cassert>
+ #include <cinttypes>
++#include <cstdlib>
+ 
+ #include "im3d/im3d.h"
+ #include "im3d/im3d_math.h"
+@@ -1011,8 +1012,25 @@ namespace RT64 {
+                     
+                     // Set whether the texture coordinates should be scaled or not based on the current configuration mode and the extended GBI flags.
+                     const bool forcedUpscale2D = (flags.rect == 0) || (upscale2D == UserConfiguration::Upscale2D::All) || callDesc.extendedFlags.forceUpscale2D;
+-                    const bool upscaleIfScaledRect = (upscale2D == UserConfiguration::Upscale2D::ScaledOnly) && flags.rect && !callDesc.identityRectScale();
+-                    flags.upscale2D = forcedUpscale2D || upscaleIfScaledRect;
++                    // Strip-boundary seam heuristic: rects whose shape/scale implies the game meant
++                    // native-size tiling get point-sampled at native res. Bilinear upscaling at TMEM
++                    // strip boundaries exposes sub-pixel UV drift as visible seams; point-sampling
++                    // quantises it away. GLideN64 ships the same approach (ref: issue #1756).
++                    const int32_t rectW = callDesc.rect.lrx - callDesc.rect.ulx;
++                    const int32_t rectH = callDesc.rect.lry - callDesc.rect.uly;
++                    const int32_t absDsdx = std::abs(int32_t(callDesc.rectDsdx));
++                    const int32_t absDtdy = std::abs(int32_t(callDesc.rectDtdy));
++                    const bool nearIdentityRect = (std::abs(absDsdx - 1024) < 100) && (std::abs(absDtdy - 1024) < 100);
++                    const bool stripShapedRect = (rectH > 0) && (rectH < 128) && (rectW > rectH * 4);
++                    const bool vStripShapedRect = (rectW > 0) && (rectW < 128) && (rectH > rectW * 4);
++                    // Strict strip shape overrides even forced-upscale (All mode): seams appear
++                    // regardless of mode. Near-identity remains ScaledOnly-only — in All mode the
++                    // user has opted into bilinear everywhere, so demoting borderline sprites would
++                    // be an unexpected regression.
++                    const bool demoteStripRect = flags.rect && (stripShapedRect || vStripShapedRect);
++                    const bool treatAsIdentity = callDesc.identityRectScale() || nearIdentityRect || demoteStripRect;
++                    const bool upscaleIfScaledRect = (upscale2D == UserConfiguration::Upscale2D::ScaledOnly) && flags.rect && !treatAsIdentity;
++                    flags.upscale2D = (forcedUpscale2D || upscaleIfScaledRect) && !demoteStripRect;
+ 
+                     if (proj.usesViewport()) {
+                         flags.culling = (callDesc.geometryMode & callDesc.cullBothMask) != 0;

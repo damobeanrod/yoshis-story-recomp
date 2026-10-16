@@ -1,0 +1,165 @@
+diff --git a/src/common/rt64_enhancement_configuration.cpp b/src/common/rt64_enhancement_configuration.cpp
+index 1194a96..3ad457f 100644
+--- a/src/common/rt64_enhancement_configuration.cpp
++++ b/src/common/rt64_enhancement_configuration.cpp
+@@ -11,6 +11,7 @@ namespace RT64 {
+         framebuffer.reinterpretFixULS = true;
+         presentation.mode = Presentation::Mode::SkipBuffering;
+         presentation.removeBlackBorders = true;
++        presentation.crtStrength = 0.0f;
+         rect.fixRectLR = true;
+         f3dex.forceBranch = false;
+         s2dex.fixBilerpMismatch = true;
+diff --git a/src/common/rt64_enhancement_configuration.h b/src/common/rt64_enhancement_configuration.h
+index 9ac8087..2dfbde8 100644
+--- a/src/common/rt64_enhancement_configuration.h
++++ b/src/common/rt64_enhancement_configuration.h
+@@ -21,6 +21,8 @@ namespace RT64 {
+ 
+             Mode mode;
+             bool removeBlackBorders;
++            // Strength of the CRT filter (scanlines and aperture grille), 0 to 1.
++            float crtStrength;
+         };
+         
+         struct Rect {
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 7de5b69..258aa9e 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -99,6 +99,7 @@ namespace RT64 {
+         hlslpp::float2 resolutionScale;
+         EnhancementConfiguration::Presentation::Mode presentationMode;
+         bool removeBlackBorders;
++        float crtStrength;
+         UserConfiguration::RefreshRate refreshRate;
+         UserConfiguration::Filtering filtering;
+         uint32_t viOriginalRate;
+@@ -108,6 +109,7 @@ namespace RT64 {
+             resolutionScale = ext.sharedResources->resolutionScale;
+             presentationMode = ext.sharedResources->enhancementConfig.presentation.mode;
+             removeBlackBorders = ext.sharedResources->enhancementConfig.presentation.removeBlackBorders;
++            crtStrength = ext.sharedResources->enhancementConfig.presentation.crtStrength;
+             refreshRate = ext.sharedResources->userConfig.refreshRate;
+             filtering = ext.sharedResources->userConfig.filtering;
+             viOriginalRate = ext.sharedResources->viOriginalRate;
+@@ -324,6 +326,7 @@ namespace RT64 {
+                     renderParams.filtering = filtering;
+                     renderParams.vi = &present.screenVI;
+                     renderParams.removeBlackBorders = removeBlackBorders;
++                    renderParams.crtStrength = crtStrength;
+ 
+                     const bool useDownsampling = (colorTarget->downsampleMultiplier > 1);
+                     if (useDownsampling) {
+diff --git a/src/render/rt64_vi_renderer.cpp b/src/render/rt64_vi_renderer.cpp
+index b4ff4e9..4d76453 100644
+--- a/src/render/rt64_vi_renderer.cpp
++++ b/src/render/rt64_vi_renderer.cpp
+@@ -77,6 +77,8 @@ namespace RT64 {
+         pushConstants.videoResolution = computeHDSize(hlslpp::float2(p.vi->fbSize()), p.resolutionScale, p.downsamplingScale);
+         pushConstants.textureResolution = { float(p.textureWidth), float(p.textureHeight) };
+         pushConstants.gamma = p.vi->gamma();
++        pushConstants.crtStrength = p.crtStrength;
++        pushConstants.nativeResolution = hlslpp::float2(p.vi->fbSize());
+ 
+         p.commandList->setPipeline(shader->pipeline.get());
+         p.commandList->setGraphicsPipelineLayout(shader->pipelineLayout.get());
+diff --git a/src/render/rt64_vi_renderer.h b/src/render/rt64_vi_renderer.h
+index 8a3782a..b18ba77 100644
+--- a/src/render/rt64_vi_renderer.h
++++ b/src/render/rt64_vi_renderer.h
+@@ -29,6 +29,7 @@ namespace RT64 {
+             UserConfiguration::Filtering filtering = UserConfiguration::Filtering::Linear;
+             const VI *vi = nullptr;
+             bool removeBlackBorders = false;
++            float crtStrength = 0.0f;
+         };
+ 
+         VIRenderer();
+diff --git a/src/shaders/VideoInterfacePS.hlsl b/src/shaders/VideoInterfacePS.hlsl
+index 3f33475..686173f 100644
+--- a/src/shaders/VideoInterfacePS.hlsl
++++ b/src/shaders/VideoInterfacePS.hlsl
+@@ -32,10 +32,66 @@ float4 PixelAntialiasing(float2 uv) {
+     return SampleInput(uvTexspace / gConstants.textureResolution);
+ }
+ 
++// CRT look: scanlines on the console's native lines plus an RGB aperture
++// grille on the window's pixels. Both fade out when the window has too few
++// pixels per native line to draw them without aliasing.
++//
++// Each scanline shows the average colour across its whole native line. With
++// upscaling, content moves in steps finer than a native line; lighting it by
++// where it sits within the line made edges pulse (shimmer) while panning.
++
++// Average colour of native line `lineIndex` at horizontal position u.
++float3 NativeLineColor(float lineIndex, float u) {
++    float3 sum = float3(0.0f, 0.0f, 0.0f);
++    [unroll]
++    for (int i = 0; i < 4; i++) {
++        const float v = (lineIndex + (float(i) + 0.5f) / 4.0f) / gConstants.nativeResolution.y;
++        sum += SampleInput((float2(u, v) / gConstants.textureResolution) * gConstants.videoResolution).rgb;
++    }
++
++    return sum * 0.25f;
++}
++
++float3 ApplyCRT(float3 color, float2 uv, float2 pos) {
++    const float strength = saturate(gConstants.crtStrength);
++    const float2 nativePos = uv * gConstants.nativeResolution;
++    const float2 nativeStep = fwidth(nativePos);
++    const float fade = saturate(1.5f - 2.0f * max(nativeStep.x, nativeStep.y));
++    const float amount = strength * fade;
++    if (amount <= 0.0f) {
++        return color;
++    }
++
++    const float3 lineColor = NativeLineColor(floor(nativePos.y), uv.x);
++
++    // Brighter lines light up a wider beam, like a real electron gun. The
++    // profile is averaged over the pixel's height so it doesn't beat against
++    // the window's pixel grid when the scale isn't a whole number.
++    const float luma = dot(lineColor, float3(0.299f, 0.587f, 0.114f));
++    const float sigma = lerp(0.20f, 0.36f, luma);
++    float scanline = 0.0f;
++    [unroll]
++    for (int i = 0; i < 4; i++) {
++        const float distance = frac(nativePos.y + (float(i) - 1.5f) * 0.25f * nativeStep.y) - 0.5f;
++        scanline += exp(-(distance * distance) / (2.0f * sigma * sigma));
++    }
++
++    scanline *= 0.25f;
++
++    const uint phase = uint(pos.x) % 3;
++    float3 mask = float3(0.82f, 0.82f, 0.82f);
++    mask[phase] = 1.18f;
++
++    const float3 crt = saturate(lineColor * scanline * mask * 1.35f);
++    return lerp(color, crt, amount);
++}
++
+ float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0) : SV_TARGET {
+ #ifdef PIXEL_ANTIALIASING
+-    return PixelAntialiasing(uv);
++    float4 color = PixelAntialiasing(uv);
+ #else
+-    return SampleInput((uv / gConstants.textureResolution) * gConstants.videoResolution);
++    float4 color = SampleInput((uv / gConstants.textureResolution) * gConstants.videoResolution);
+ #endif
++    color.rgb = ApplyCRT(color.rgb, uv, pos.xy);
++    return color;
+ }
+\ No newline at end of file
+diff --git a/src/shared/rt64_video_interface.h b/src/shared/rt64_video_interface.h
+index b51cf09..a45f5a1 100644
+--- a/src/shared/rt64_video_interface.h
++++ b/src/shared/rt64_video_interface.h
+@@ -13,6 +13,8 @@ namespace interop {
+         float2 videoResolution;
+         float2 textureResolution;
+         float gamma;
++        float crtStrength;
++        float2 nativeResolution;
+     };
+ #ifdef HLSL_CPU
+ };

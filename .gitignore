@@ -1,0 +1,13 @@
+build_dbg/
+build/
+*.z64
+build-n64recomp/
+*.log
+__pycache__/
+data/settings.ini
+gdb.txt
+rsp/aspMain.cpp
+rsp/aspMain.toml
+data/saves/
+imgui.ini
+*.bak

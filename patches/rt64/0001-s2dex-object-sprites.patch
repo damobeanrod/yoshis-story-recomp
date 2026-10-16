@@ -1,0 +1,512 @@
+diff --git a/src/gbi/rt64_gbi_s2dex.cpp b/src/gbi/rt64_gbi_s2dex.cpp
+index 4b41bfa..2fcae10 100644
+--- a/src/gbi/rt64_gbi_s2dex.cpp
++++ b/src/gbi/rt64_gbi_s2dex.cpp
+@@ -4,6 +4,10 @@
+ 
+ #include "rt64_gbi_s2dex.h"
+ 
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
+ #include "../include/rt64_extended_gbi.h"
+ 
+ #include "rt64_gbi_extended.h"
+@@ -546,6 +550,240 @@ namespace RT64 {
+             }
+         }
+ 
++        // S2DEX object sprites (GBI1 S2DEX 1.05+). The coordinate maths is the
++        // microcode's fixed-point arithmetic as decoded by olivieryuyu (see
++        // GLideN64's S2DEX.cpp), including the render-mode corrections: with
++        // G_OBJRM_BILERP sprites move half a pixel and the texture half a texel so
++        // pixel centres sample texel centres. Sprites become RDP texture rectangles
++        // over the texture loaded into TMEM by G_OBJ_LOADTXTR.
++        struct ObjCorrector {
++            int16_t A0, A1, A2, A3, B0, B2, B3;
++        };
++
++        static ObjCorrector objCorrector(uint32_t renderMode) {
++            // Halfword tables of the microcode (low half first per word).
++            static const uint16_t A01[16] = { 0x0000, 0x0000, 0x0020, 0x0010, 0x0040, 0x0020, 0x0060, 0x0030,
++                                              0xFFF4, 0x0000, 0x0014, 0x0010, 0x0034, 0x0020, 0x0054, 0x0030 };
++            static const uint16_t A23[8] = { 0xFFFE, 0x0001, 0xFFFE, 0xFFFE, 0x0000, 0x0001, 0x0000, 0x0000 };
++            static const uint16_t B03[8] = { 0x0000, 0xFFFC, 0x0001, 0x0000, 0x0003, 0xFFFF, 0x0000, 0xFFF0 };
++            const uint32_t o1 = (renderMode & (S2DEX_G_OBJRM_SHRINKSIZE_1 | S2DEX_G_OBJRM_SHRINKSIZE_2 | S2DEX_G_OBJRM_WIDEN)) >> 3;
++            const uint32_t o2 = (renderMode & (S2DEX_G_OBJRM_SHRINKSIZE_1 | S2DEX_G_OBJRM_BILERP)) >> 2;
++            const uint32_t o3 = (renderMode & S2DEX_G_OBJRM_BILERP) >> 1;
++            ObjCorrector c;
++            c.A0 = int16_t(A01[(0 + o1) ^ 1]);
++            c.A1 = int16_t(A01[(1 + o1) ^ 1]);
++            c.A2 = int16_t(A23[(0 + o2) ^ 1]);
++            c.A3 = int16_t(A23[(1 + o2) ^ 1]);
++            c.B0 = int16_t(B03[(0 + o3) ^ 1]);
++            c.B2 = int16_t(B03[(2 + o3) ^ 1]);
++            c.B3 = int16_t(B03[(3 + o3) ^ 1]);
++            return c;
++        }
++
++        static uObjMtx &objMtx(State *state) {
++            return *reinterpret_cast<uObjMtx *>(state->rsp->S2D.objMtx.data());
++        }
++
++        // Identity matrix with unit base scale, as the microcode's DMEM starts.
++        static void resetObjMtx(State *state) {
++            uObjMtx &m = objMtx(state);
++            m.A = 0x10000; m.B = 0; m.C = 0; m.D = 0x10000;
++            m.X = 0; m.Y = 0;
++            m.BaseScaleX = 0x400; m.BaseScaleY = 0x400;
++        }
++
++        void objMoveMem(State *state, DisplayList **dl) {
++            // gSPObjMatrix: length 24, offset 0. gSPObjSubMatrix: length 8, offset 2 (x8 bytes).
++            const uint32_t length = (((*dl)->w0 >> 16) & 0xFF) + 1;
++            const uint32_t offset = ((*dl)->w0 & 0xFFFF) * 8;
++            auto &mtx = state->rsp->S2D.objMtx;
++            if ((offset + length) <= mtx.size()) {
++                const uint32_t rdramAddress = state->rsp->fromSegmentedMasked((*dl)->w1);
++                memcpy(mtx.data() + offset, state->fromRDRAM(rdramAddress), length);
++            }
++        }
++
++        // Sets the render tile from the sprite description.
++        static void setupObjTile(State *state, const uObjSprite &sprite) {
++            RDP *rdp = state->rdp.get();
++            const uint8_t clamp = (state->rsp->objRenderMode & S2DEX_G_OBJRM_NOTXCLAMP) ? G_TX_WRAP : G_TX_CLAMP;
++            rdp->setTile(G_TX_RENDERTILE, sprite.imageFmt, sprite.imageSiz, sprite.imageStride, sprite.imageAdrs, sprite.imagePal,
++                clamp, clamp, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
++            const uint16_t texW = std::max(sprite.imageW >> 5, 1);
++            const uint16_t texH = std::max(sprite.imageH >> 5, 1);
++            rdp->setTileSize(G_TX_RENDERTILE, 0, 0, (texW - 1) << 2, (texH - 1) << 2);
++        }
++
++        // Emits one texture rectangle. x/y are screen edges in 10.2; s/t are texel
++        // coordinates at those edges (sa at xa, sb at xb, ...). With swapST the
++        // RDP's flipped rectangle is used: S follows screen Y, T follows screen X
++        // (sprites turned by 90 or 270 degrees).
++        static void emitObjQuad(State *state, const uObjSprite &sprite, int32_t xa, int32_t xb, int32_t ya, int32_t yb,
++            float sa, float sb, float ta, float tb, bool swapST)
++        {
++            // Order the edges, carrying the coordinate that follows each axis.
++            float &xFirst = swapST ? ta : sa, &xSecond = swapST ? tb : sb;
++            float &yFirst = swapST ? sa : ta, &ySecond = swapST ? sb : tb;
++            if (xb < xa) { std::swap(xa, xb); std::swap(xFirst, xSecond); }
++            if (yb < ya) { std::swap(ya, yb); std::swap(yFirst, ySecond); }
++            const float widthPx = (xb - xa) / 4.0f;
++            const float heightPx = (yb - ya) / 4.0f;
++            if ((widthPx <= 0.0f) || (heightPx <= 0.0f)) {
++                return;
++            }
++
++            // S/T start values and steps per pixel along the axis each one follows.
++            const float sStart = swapST ? yFirst : xFirst, sEnd = swapST ? ySecond : xSecond;
++            const float tStart = swapST ? xFirst : yFirst, tEnd = swapST ? xSecond : ySecond;
++            float stepS = (sEnd - sStart) / (swapST ? heightPx : widthPx);
++            const float stepT = (tEnd - tStart) / (swapST ? widthPx : heightPx);
++
++            // drawTexRect divides dsdx by 4 in copy mode (as the RDP expects).
++            RDP *rdp = state->rdp.get();
++            if (rdp->otherMode.cycleType() == G_CYC_COPY) {
++                stepS *= 4.0f;
++            }
++
++            const int16_t dsdx = int16_t(lroundf(stepS * 1024.0f));
++            const int16_t dtdy = int16_t(lroundf(stepT * 1024.0f));
++            int16_t ult = int16_t(lroundf(tStart * 32.0f));
++
++            // RDP::drawRect adds one whole dtdy step to T when the rect starts on a
++            // fractional scanline (vFractionOffset). The object coordinates above already
++            // place the texture for the exact sub-pixel position (the microcode's th
++            // correction), so cancel that step: otherwise stacked parts of a sprite
++            // (text lines, strips) with different sub-pixel starts shift by a texel
++            // relative to each other, visible as cuts while text scrolls.
++            if ((ya & 0x3) != 0) {
++                ult = int16_t(ult - (dtdy >> 5));
++            }
++
++            setupObjTile(state, sprite);
++            rdp->drawTexRect(xa, ya, xb, yb, G_TX_RENDERTILE,
++                int16_t(lroundf(sStart * 32.0f)), ult, dsdx, dtdy, swapST);
++        }
++
++        // G_OBJ_RECTANGLE (no matrix) and G_OBJ_RECTANGLE_R (matrix X/Y/BaseScale).
++        static void doObjRectangleGeneric(State *state, const uObjSprite &sprite, bool useMatrix) {
++            const ObjCorrector cc = objCorrector(state->rsp->objRenderMode);
++            const uObjMtx &m = objMtx(state);
++            const uint32_t spriteScaleW = std::max<uint32_t>(sprite.scaleW, 1);
++            const uint32_t spriteScaleH = std::max<uint32_t>(sprite.scaleH, 1);
++            int16_t xh, xl, yh, yl;
++            uint32_t scaleH;
++            if (useMatrix) {
++                const uint32_t baseScaleX = std::max<uint32_t>(m.BaseScaleX, 1);
++                const uint32_t baseScaleY = std::max<uint32_t>(m.BaseScaleY, 1);
++                const uint32_t scaleW = std::max<uint32_t>((baseScaleX * 0x40 * spriteScaleW) >> 16, 1);
++                scaleH = std::max<uint32_t>((baseScaleY * 0x40 * spriteScaleH) >> 16, 1);
++                const int32_t xhp = int32_t(((int64_t(sprite.objX) * 65536 * 0x0800) * int64_t(0x80007FFFU / baseScaleX)) >> 32)
++                    + int32_t(int16_t((m.X + cc.A2) & cc.B0)) * 65536;
++                const int32_t xlp = xhp + int32_t((((uint64_t(sprite.imageW) - cc.A1) << 24) * (0x80007FFFU / scaleW)) >> 32);
++                const int32_t yhp = int32_t(((int64_t(sprite.objY) * 65536 * 0x0800) * int64_t(0x80007FFFU / baseScaleY)) >> 32)
++                    + int32_t(int16_t((m.Y + cc.A2) & cc.B0)) * 65536;
++                const int32_t ylp = yhp + int32_t((((uint64_t(sprite.imageH) - cc.A1) << 24) * (0x80007FFFU / scaleH)) >> 32);
++                xh = int16_t(xhp >> 16); xl = int16_t(xlp >> 16);
++                yh = int16_t(yhp >> 16); yl = int16_t(ylp >> 16);
++            }
++            else {
++                scaleH = spriteScaleH;
++                xh = int16_t((sprite.objX + cc.A2) & cc.B0);
++                xl = int16_t(int16_t((((uint64_t(sprite.imageW) - cc.A1) << 24) * (0x80007FFFU / spriteScaleW)) >> 48) + xh);
++                yh = int16_t((sprite.objY + cc.A2) & cc.B0);
++                yl = int16_t(int16_t((((uint64_t(sprite.imageH) - cc.A1) << 24) * (0x80007FFFU / spriteScaleH)) >> 48) + yh);
++            }
++
++            // Texture coordinates in s10.5.
++            const int16_t sh = int16_t(cc.A0 + cc.B2);
++            const int16_t sl = int16_t(sh + sprite.imageW + cc.A0 - cc.A1 - 1);
++            const int16_t th = int16_t(sh - int16_t((uint32_t(yh & 3) * 0x0200 * scaleH) >> 16));
++            const int16_t tl = int16_t(th + sprite.imageH + cc.A0 - cc.A1 - 1);
++            float s0 = sh / 32.0f, s1 = sl / 32.0f, t0 = th / 32.0f, t1 = tl / 32.0f;
++            if (sprite.imageFlags & S2DEX_G_OBJ_FLAG_FLIPS) std::swap(s0, s1);
++            if (sprite.imageFlags & S2DEX_G_OBJ_FLAG_FLIPT) std::swap(t0, t1);
++            emitObjQuad(state, sprite, xh, xl, yh, yl, s0, s1, t0, t1, false);
++        }
++
++        static void doObjRectangle(State *state, const uObjSprite &sprite) {
++            doObjRectangleGeneric(state, sprite, false);
++        }
++
++        static void doObjRectangleR(State *state, const uObjSprite &sprite) {
++            doObjRectangleGeneric(state, sprite, true);
++        }
++
++        // G_OBJ_SPRITE: transformed by the full 2D matrix, screen = M * (x, y) + (X, Y)
++        // with M = [A B; C D]. Axis-aligned and quarter-turn sprites become texture
++        // rectangles; other rotations a textured quad (RDP::drawTexQuad).
++        static void doObjSprite(State *state, const uObjSprite &sprite) {
++            const ObjCorrector cc = objCorrector(state->rsp->objRenderMode);
++            const uObjMtx &m = objMtx(state);
++            const int16_t x0 = int16_t((m.X + cc.B3) & cc.B0);
++            const int16_t y0 = int16_t((m.Y + cc.B3) & cc.B0);
++            const int16_t ulx = int16_t(sprite.objX + cc.A3);
++            const int16_t uly = int16_t(sprite.objY + cc.A3);
++            const uint32_t spriteScaleW = std::max<uint32_t>(sprite.scaleW, 1);
++            const uint32_t spriteScaleH = std::max<uint32_t>(sprite.scaleH, 1);
++            const int16_t lrx = int16_t(int16_t((((uint64_t(sprite.imageW) - cc.A1) << 8) * (0x80007FFFU / spriteScaleW)) >> 32) + ulx);
++            const int16_t lry = int16_t(int16_t((((uint64_t(sprite.imageH) - cc.A1) << 8) * (0x80007FFFU / spriteScaleH)) >> 32) + uly);
++            auto calcX = [&](int16_t x, int16_t y) {
++                return int32_t(int16_t(x0 + int16_t((int64_t(x) * m.A) >> 16) + int16_t((int64_t(y) * m.B) >> 16)));
++            };
++            auto calcY = [&](int16_t x, int16_t y) {
++                return int32_t(int16_t(y0 + int16_t((int64_t(x) * m.C) >> 16) + int16_t((int64_t(y) * m.D) >> 16)));
++            };
++
++            // One texel per sprite pixel: the texture spans imageW x imageH texels
++            // over the sprite. Games tile images from overlapping sprite strips
++            // (Yoshi's Story: 16-row strips placed 15 rows apart) that only line up
++            // at exactly this rate; mapping W-1 texels over W pixels left seams and
++            // dropped half a row at mirrored edges.
++            float s0 = 0.0f, s1 = sprite.imageW / 32.0f;
++            float t0 = 0.0f, t1 = sprite.imageH / 32.0f;
++            if (sprite.imageFlags & S2DEX_G_OBJ_FLAG_FLIPS) std::swap(s0, s1);
++            if (sprite.imageFlags & S2DEX_G_OBJ_FLAG_FLIPT) std::swap(t0, t1);
++
++            // Corners: (ulx,uly) -> (s0,t0), (lrx,uly) -> (s1,t0), (ulx,lry) -> (s0,t1).
++            const int32_t px00 = calcX(ulx, uly), py00 = calcY(ulx, uly);
++            const int32_t px10 = calcX(lrx, uly), py10 = calcY(lrx, uly);
++            const int32_t px01 = calcX(ulx, lry), py01 = calcY(ulx, lry);
++            const bool axisAligned = (m.B == 0) && (m.C == 0);
++            const bool quarterTurn = (m.A == 0) && (m.D == 0);
++            if (axisAligned) {
++                emitObjQuad(state, sprite, px00, px10, py00, py01, s0, s1, t0, t1, false);
++            }
++            else if (quarterTurn) {
++                // Sprite X runs along screen Y (texture S), sprite Y along screen X (T).
++                emitObjQuad(state, sprite, px00, px01, py00, py10, s0, s1, t0, t1, true);
++            }
++            else {
++                // Any other rotation: a textured quad through the four transformed corners.
++                const int32_t qx[4] = { px00, px10, px01, calcX(lrx, lry) };
++                const int32_t qy[4] = { py00, py10, py01, calcY(lrx, lry) };
++                const float qs[4] = { s0, s1, s0, s1 };
++                const float qt[4] = { t0, t0, t1, t1 };
++                setupObjTile(state, sprite);
++                state->rdp->drawTexQuad(qx, qy, qs, qt, G_TX_RENDERTILE);
++            }
++        }
++
++        static const uObjSprite &readObjSprite(State *state, uint32_t segAddress) {
++            readS2DStruct(state, segAddress, sizeof(uObjSprite));
++            return *reinterpret_cast<const uObjSprite *>(state->rsp->S2D.struct_buffer.data());
++        }
++
++        void objRectangle(State *state, DisplayList **dl) {
++            doObjRectangle(state, readObjSprite(state, (*dl)->w1));
++        }
++
++        void objRectangleR(State *state, DisplayList **dl) {
++            doObjRectangleR(state, readObjSprite(state, (*dl)->w1));
++        }
++
++        void objSprite(State *state, DisplayList **dl) {
++            doObjSprite(state, readObjSprite(state, (*dl)->w1));
++        }
++
+         void objLoadTxtr(State *state, DisplayList **dl) {
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxtr::start(0x%08X)", (*dl)->w1);
+@@ -573,8 +811,7 @@ namespace RT64 {
+             doLoadTxtr(state, &obj->txtr);
+             
+             // Execute the sprite draw
+-            // TODO call doObjSprite(state, &obj->sprite) when it's implemented
+-            assert(false);
++            doObjSprite(state, obj->sprite);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxSprite::end(0x%08X)", (*dl)->w1);
+         #endif
+@@ -592,8 +829,7 @@ namespace RT64 {
+             doLoadTxtr(state, &obj->txtr);
+             
+             // Execute the rect draw
+-            // TODO call doObjRectangle(state, &obj->sprite) when it's implemented
+-            assert(false);
++            doObjRectangle(state, obj->sprite);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxRect::end(0x%08X)", (*dl)->w1);
+         #endif
+@@ -611,15 +847,21 @@ namespace RT64 {
+             doLoadTxtr(state, &obj->txtr);
+             
+             // Execute the rect r draw
+-            // TODO call doObjRectangleR(state, &obj->sprite) when it's implemented
+-            assert(false);
++            doObjRectangleR(state, obj->sprite);
+         #ifdef LOG_LOADTXTR_METHODS
+             RT64_LOG_PRINTF("objLoadTxRectR::end(0x%08X)", (*dl)->w1);
+         #endif
+         }
+ 
++        // The texture-load statuses (sid/flag/mask) and the object matrix live in DMEM,
++        // which a task start or a G_LOAD_UCODE reinitialises. Without resetting on load,
++        // G_OBJ_LOADTXTR skips loads whose status survived while 3D drawing reused TMEM.
+         void reset(State *state) {
+             state->rsp->objRenderMode = 0x0;
++            state->rsp->S2D.struct_buffer.fill(0);
++            state->rsp->S2D.statuses.fill(0);
++            state->rsp->S2D.data_02AE = -128;
++            resetObjMtx(state);
+         }
+ 
+         void setup(GBI *gbi) {
+@@ -645,6 +887,10 @@ namespace RT64 {
+             gbi->map[S2DEX_G_OBJ_LDTX_SPRITE] = &objLoadTxSprite;
+             gbi->map[S2DEX_G_OBJ_LDTX_RECT] = &objLoadTxRect;
+             gbi->map[S2DEX_G_OBJ_LDTX_RECT_R] = &objLoadTxRectR;
++            gbi->map[S2DEX_G_OBJ_MOVEMEM] = &objMoveMem;
++            gbi->map[S2DEX_G_OBJ_RECTANGLE] = &objRectangle;
++            gbi->map[S2DEX_G_OBJ_RECTANGLE_R] = &objRectangleR;
++            gbi->map[S2DEX_G_OBJ_SPRITE] = &objSprite;
+             gbi->map[F3D_G_DL] = &GBI_F3D::runDl;
+             gbi->map[F3D_G_ENDDL] = &GBI_F3D::endDl;
+             gbi->map[F3D_G_MOVEWORD] = &moveWord;
+@@ -659,6 +905,7 @@ namespace RT64 {
+             gbi->map[G_SETTIMG] = &GBI_F3D::setTextureImage;
+ 
+             gbi->resetFromTask = &reset;
++            gbi->resetFromLoad = &reset;
+         }
+     }
+ };
+\ No newline at end of file
+diff --git a/src/gbi/rt64_gbi_s2dex.h b/src/gbi/rt64_gbi_s2dex.h
+index 8de11eb..6d369e6 100644
+--- a/src/gbi/rt64_gbi_s2dex.h
++++ b/src/gbi/rt64_gbi_s2dex.h
+@@ -8,6 +8,10 @@
+ 
+ #define S2DEX_G_BG_1CYC 0x01
+ #define S2DEX_G_BG_COPY 0x02
++#define S2DEX_G_OBJ_RECTANGLE 0x03
++#define S2DEX_G_OBJ_SPRITE 0x04
++#define S2DEX_G_OBJ_MOVEMEM 0x05
++#define S2DEX_G_OBJ_RECTANGLE_R 0xB2
+ #define S2DEX_G_RDPHALF_0 0xE4
+ #define S2DEX_G_SELECT_DL 0xB0
+ #define S2DEX_G_OBJ_LOADTXTR 0xC1
+@@ -26,6 +30,8 @@
+ #define S2DEX_G_OBJRM_SHRINKSIZE_1 0x10
+ #define S2DEX_G_OBJRM_SHRINKSIZE_2 0x20
+ #define S2DEX_G_OBJRM_WIDEN 0x40
++#define S2DEX_G_OBJ_FLAG_FLIPS 0x01
++#define S2DEX_G_OBJ_FLAG_FLIPT 0x10
+ 
+ namespace RT64 {
+     namespace GBI_S2DEX {
+@@ -93,9 +99,35 @@ namespace RT64 {
+             uint32_t mask;
+         };
+ 
++        // libultra uObjSprite (gs2dex.h), halfwords/bytes swapped per word.
++        struct uObjSprite {
++            uint16_t scaleW;      // u5.10
++            int16_t objX;         // s10.2
++            uint16_t paddingX;
++            uint16_t imageW;      // u10.5
++            uint16_t scaleH;      // u5.10
++            int16_t objY;         // s10.2
++            uint16_t paddingY;
++            uint16_t imageH;      // u10.5
++            uint16_t imageAdrs;   // TMEM address, 64-bit words
++            uint16_t imageStride; // 64-bit words
++            uint8_t imageFlags;
++            uint8_t imagePal;
++            uint8_t imageSiz;
++            uint8_t imageFmt;
++        };
++
++        // libultra uObjMtx: A-D s15.16, X/Y s10.2, BaseScale u5.10. uObjSubMtx
++        // (X, Y, BaseScaleX, BaseScaleY) is loaded at offset 0x10 of it.
++        struct uObjMtx {
++            int32_t A, B, C, D;
++            int16_t Y, X;
++            uint16_t BaseScaleY, BaseScaleX;
++        };
++
+         struct uObjTxSprite {
+             uObjTxtr txtr;
+-            // uObjSprite sprite;
++            uObjSprite sprite;
+         };
+ #pragma pack(pop)
+ 
+@@ -107,6 +139,10 @@ namespace RT64 {
+         void objLoadTxSprite(State* state, DisplayList** dl);
+         void objLoadTxRect(State* state, DisplayList** dl);
+         void objLoadTxRectR(State* state, DisplayList** dl);
++        void objMoveMem(State *state, DisplayList **dl);
++        void objRectangle(State *state, DisplayList **dl);
++        void objRectangleR(State *state, DisplayList **dl);
++        void objSprite(State *state, DisplayList **dl);
+         void rdpHalf0(State *state, DisplayList **dl);
+ 
+         void setup(GBI *gbi);
+diff --git a/src/hle/rt64_rdp.cpp b/src/hle/rt64_rdp.cpp
+index a10c11a..d2dc6be 100644
+--- a/src/hle/rt64_rdp.cpp
++++ b/src/hle/rt64_rdp.cpp
+@@ -1342,6 +1342,86 @@ namespace RT64 {
+         drawRect(ulx, uly, lrx, lry, uls, ult, dsdx, dtdy, flip, extAlignment);
+     }
+ 
++    void RDP::drawTexQuad(const int32_t x[4], const int32_t y[4], const float s[4], const float t[4], uint8_t tile) {
++        DrawCall &drawCall = state->drawCall;
++        if (!drawCall.textureOn || (drawCall.textureTile != tile) || (drawCall.textureLevels != 1)) {
++            drawCall.textureOn = 1;
++            drawCall.textureTile = tile;
++            drawCall.textureLevels = 1;
++            state->updateDrawStatusAttribute(DrawAttribute::Texture);
++        }
++
++        // The quad is drawn as a rectangle covering its bounding box, with the corners
++        // placed inside it: rect draws map vertex positions in [-1, 1] onto the rect.
++        const int32_t ulx = std::min(std::min(x[0], x[1]), std::min(x[2], x[3]));
++        const int32_t lrx = std::max(std::max(x[0], x[1]), std::max(x[2], x[3]));
++        const int32_t uly = std::min(std::min(y[0], y[1]), std::min(y[2], y[3]));
++        const int32_t lry = std::max(std::max(y[0], y[1]), std::max(y[2], y[3]));
++        const ExtendedAlignment &extAlignment = extended.global.rect;
++        const FixedRect drawRect(movedFromOrigin(ulx, extAlignment.leftOrigin), uly, movedFromOrigin(lrx, extAlignment.rightOrigin), lry);
++        if (drawRect.isEmpty() || (lrx == ulx) || (lry == uly)) {
++            return;
++        }
++
++        checkFramebufferPair();
++        state->flush();
++
++        const int workloadCursor = state->ext.workloadQueue->writeCursor;
++        Workload &workload = state->ext.workloadQueue->workloads[workloadCursor];
++        FramebufferPair &fbPair = workload.fbPairs[workload.currentFramebufferPairIndex()];
++        if (!fbPair.inProjection(0, Projection::Type::Rectangle)) {
++            fbPair.changeProjection(0, Projection::Type::Rectangle);
++        }
++
++        const FixedRect &scissorRect = state->rdp->scissorRectStack[scissorStackSize - 1];
++        if (!scissorRect.isNull()) {
++            fbPair.scissorRect.merge(scissorRect);
++            const FixedRect intRect = scissorRect.intersection(drawRect);
++            if (!intRect.isNull()) {
++                fbPair.drawColorRect.merge(intRect);
++                if (otherMode.zUpd()) {
++                    fbPair.drawDepthRect.merge(intRect);
++                }
++            }
++        }
++
++        bool flushedState = state->checkDrawState();
++        drawCall.minWorldMatrix = 0;
++        drawCall.maxWorldMatrix = 0;
++        drawCall.rect = drawRect;
++        drawCall.rectDsdx = 1 << 10;
++        drawCall.rectDtdy = 1 << 10;
++        drawCall.rectLeftOrigin = extAlignment.leftOrigin;
++        drawCall.rectRightOrigin = extAlignment.rightOrigin;
++        drawCall.rectAspect = extended.global.rectAspect;
++        if (flushedState) {
++            state->loadDrawState();
++        }
++
++        auto &triPosFloats = workload.drawData.triPosFloats;
++        auto &triTcFloats = workload.drawData.triTcFloats;
++        auto &triColorFloats = workload.drawData.triColorFloats;
++        const float invW = 2.0f / float(lrx - ulx);
++        const float invH = 2.0f / float(lry - uly);
++        static const int order[6] = { 0, 1, 2, 3, 1, 2 };
++        for (int i : order) {
++            triPosFloats.emplace_back(float(x[i] - ulx) * invW - 1.0f);
++            triPosFloats.emplace_back(1.0f - float(y[i] - uly) * invH);
++            triPosFloats.emplace_back(0.0f);
++            triPosFloats.emplace_back(1.0f);
++            triTcFloats.emplace_back(s[i]);
++            triTcFloats.emplace_back(t[i]);
++            for (int c = 0; c < 4; c++) {
++                triColorFloats.emplace_back(0.0f);
++            }
++        }
++
++        drawCall.triangleCount += 2;
++        for (int i = 0; i < 4; i++) {
++            updateCallTexcoords(s[i], t[i]);
++        }
++    }
++
+     void RDP::updateCallTexcoords(float u, float v) {
+         const int workloadCursor = state->ext.workloadQueue->writeCursor;
+         Workload &workload = state->ext.workloadQueue->workloads[workloadCursor];
+diff --git a/src/hle/rt64_rdp.h b/src/hle/rt64_rdp.h
+index 84f4e7c..eaae382 100644
+--- a/src/hle/rt64_rdp.h
++++ b/src/hle/rt64_rdp.h
+@@ -210,6 +210,10 @@ namespace RT64 {
+         void drawRect(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, int16_t uls, int16_t ult, int16_t dsdx, int16_t dtdy, bool flip, const ExtendedAlignment &extAlignment);
+         void drawTexRect(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls, int16_t ult, int16_t dsdx, int16_t dtdy, bool flip);
+         void drawTexRect(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls, int16_t ult, int16_t dsdx, int16_t dtdy, bool flip, const ExtendedAlignment &extAlignment);
++        // Textured screen-space quad with arbitrary corners (10.2 coordinates) and per-corner texel
++        // coordinates, in the order upper-left, upper-right, lower-left, lower-right of the texture.
++        // Used for rotated S2DEX object sprites, which texture rectangles can't express.
++        void drawTexQuad(const int32_t x[4], const int32_t y[4], const float s[4], const float t[4], uint8_t tile);
+         void updateCallTexcoords(float u, float v);
+     };
+ };
+\ No newline at end of file
+diff --git a/src/hle/rt64_rsp.h b/src/hle/rt64_rsp.h
+index 61bb3b1..96f70b8 100644
+--- a/src/hle/rt64_rsp.h
++++ b/src/hle/rt64_rsp.h
+@@ -194,6 +194,8 @@ namespace RT64 {
+             std::array<uint32_t, 4> statuses;
+             // Seems to hold an id corresponding to the last command run.
+             int8_t data_02AE;
++            // uObjMtx loaded by G_OBJ_MOVEMEM (raw RDRAM words, see GBI_S2DEX::uObjMtx).
++            std::array<uint8_t, 24> objMtx;
+         } S2D;
+ 
+         struct {
