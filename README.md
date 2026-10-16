@@ -35,7 +35,31 @@ Uses [N64Recomp](https://github.com/N64Recomp/N64Recomp),
 - A Vulkan-capable GPU and driver
 - Linux (Ubuntu 24.04+ or equivalent; NixOS also supported)
 
-## Getting started (Ubuntu 24.04+)
+## Getting started — AppImage (easiest)
+
+Download the AppImage from the [releases page](../../releases), make it
+executable, then set up your files next to it:
+
+```
+yoshis-story-recomp-x86_64.AppImage   ← the download
+data/
+  yoshis_story.z64                     ← your ROM goes here
+  saves/                               ← created automatically on first run
+```
+
+```bash
+chmod +x yoshis-story-recomp-x86_64.AppImage
+./yoshis-story-recomp-x86_64.AppImage
+```
+
+The AppImage is self-contained and portable — move the AppImage and its
+`data/` folder together anywhere on your system and it will work. No
+installation required. Requires SDL2, GTK3, and a Vulkan driver on the
+host system (present by default on Ubuntu 24.04+).
+
+---
+
+## Getting started — build from source (Ubuntu 24.04+)
 
 ### 1. Install dependencies
 
@@ -167,17 +191,9 @@ APPIMAGE_EXTRACT_AND_RUN=1 appimage-tools/appimagetool \
     AppDir yoshis-story-recomp-x86_64.AppImage
 ```
 
-The resulting AppImage requires SDL2, GTK3, and a Vulkan driver to be installed
-on the target system — all present by default on Ubuntu 24.04+.
-
-Users put their ROM and saves in a `data/` folder next to the AppImage:
-
-```
-yoshis-story-recomp-x86_64.AppImage
-data/
-  yoshis_story.z64
-  saves/
-```
+The resulting AppImage requires SDL2, GTK3, and a Vulkan driver on the target
+system — all present by default on Ubuntu 24.04+. See the file layout in
+**Getting started — AppImage** above.
 
 ---
 
