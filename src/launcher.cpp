@@ -38,7 +38,7 @@ static_assert(sizeof(kActionSaveNames) / sizeof(kActionSaveNames[0]) ==
 
 void input_bindings_reset_defaults(InputBindings& b) {
     b.actions[int(N64Action::A)]          = { SDL_SCANCODE_SPACE,  SDL_CONTROLLER_BUTTON_A };
-    b.actions[int(N64Action::B)]          = { SDL_SCANCODE_LSHIFT, SDL_CONTROLLER_BUTTON_B };
+    b.actions[int(N64Action::B)]          = { SDL_SCANCODE_LSHIFT, SDL_CONTROLLER_BUTTON_X };
     b.actions[int(N64Action::Z)]          = { SDL_SCANCODE_Z,      -1 };  // left trigger axis
     b.actions[int(N64Action::Start)]      = { SDL_SCANCODE_RETURN, SDL_CONTROLLER_BUTTON_START };
     b.actions[int(N64Action::L)]          = { SDL_SCANCODE_Q,      SDL_CONTROLLER_BUTTON_LEFTSHOULDER };

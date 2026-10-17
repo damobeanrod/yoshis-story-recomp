@@ -221,7 +221,7 @@ keyboard simultaneously. Rumble is forwarded to the controller.
 | --- | --- | --- |
 | Stick | WASD / arrow keys | Left stick |
 | A | Space / X | A |
-| B | Left Shift / C | B or X |
+| B | Left Shift / C | X |
 | Z | Z | Left trigger |
 | Start | Enter | Start |
 | L / R | Q / E | LB / RB (RT = R too) |
